@@ -113,12 +113,17 @@ scalping/
   ├─ 加载 config.yaml（支持环境变量覆盖）
   ├─ 初始化 REST 客户端、WebSocket 客户端、风控控制器
   ├─ 建立 WebSocket 连接，订阅订单簿
+  │    └─ WsClient 内部启动：reconnectLoop / readLoop / pingLoop
   │
   ├─ 启动 goroutine 1：主循环（mainLoop）
   │    └─ 每 500ms 执行一次 tick()
+  │         └─ Step 0：检查 WS 是否已连接，断线中则跳过本轮
   │
   ├─ 启动 goroutine 2：盈亏监控循环（pnlMonitorLoop）
   │    └─ 每 2s 检查持仓变化，更新盈亏，检查止盈止损
+  │
+  ├─ 启动 goroutine 3：连接质量监控（wsQualityMonitor）
+  │    └─ 每 30s 打印 WS 连接状态、RTT、重连次数、最近消息时间
   │
   └─ 等待 SIGINT / SIGTERM 信号
        └─ 收到信号 → Stop() → 撤销所有挂单 → 打印最终统计 → 退出
@@ -128,6 +133,9 @@ scalping/
 
 ```
 tick()
+  │
+  ├─ Step 0：WebSocket 连接检查
+  │    └─ ws.Quality().Connected == false？→ 跳过本轮（等待重连）
   │
   ├─ Step 1：风控检查
   │    ├─ 查询账户可用余额
@@ -170,9 +178,38 @@ pnlMonitorLoop()
        └─ 累计亏损 ≥ stop_loss_usdc  → 撤单 + 停止策略
 ```
 
-### 4.4 WebSocket 心跳
+### 4.4 WebSocket 心跳与重连机制
 
-WebSocket 客户端每 **20 秒**发送一次 Ping 帧，防止连接因空闲被服务端断开。
+```
+WsClient 后台 goroutine 架构：
+
+  ┌─────────────────────────────────────────────────────┐
+  │  reconnectLoop（常驻）                               │
+  │    监听 reconnCh 信号 → 指数退避等待 → dial()        │
+  │    重连成功 → resubscribeAll() 恢复所有订阅          │
+  └──────────────────────┬──────────────────────────────┘
+                         │ 每次 dial() 成功后启动
+              ┌──────────┴──────────┐
+              ▼                     ▼
+        readLoop(conn)         pingLoop(conn)
+        读取消息 → 分发回调    每 20s 发送带序号 Ping
+        断线 → 写入 reconnCh  检测 Pong 超时 → 主动断线
+```
+
+**重连参数：**
+
+| 参数 | 值 | 说明 |
+|------|----|------|
+| 初始退避 | 1s | 首次断线后等待 1 秒重连 |
+| 最大退避 | 30s | 每次失败翻倍，上限 30 秒 |
+| 连接超时 | 10s | `Dial` 握手超时 |
+| Ping 间隔 | 20s | 每 20 秒发送一次 Ping |
+| Pong 超时 | 10s | 超过 30s 未收到 Pong 则主动断线触发重连 |
+
+**RTT 延迟检测：**
+- 每次 Ping 携带递增序号，Pong 回传序号
+- 通过 `sentAt` 与 `pongAt` 差值计算往返延迟（RTT）
+- 每 30 秒由 `wsQualityMonitor` goroutine 打印连接质量报告
 
 ---
 
@@ -355,14 +392,25 @@ kill -SIGTERM <pid>
 | `[盈亏]` | 检测到平仓成交，输出本次盈亏及累计统计 |
 | `[统计]` | 每 2 秒输出一次持仓和盈亏快照 |
 | `[风控]` | 风控事件，包括拦截下单、熔断触发、连续亏损计数 |
+| `[WS]` | WebSocket 连接事件：连接成功、断线、重连、订阅恢复、Pong RTT |
+| `[WS质量]` | 每 30 秒输出一次连接质量报告（RTT、重连次数、最近消息时间） |
 
 **典型日志示例：**
 
 ```
+[WS] 连接成功: wss://pro.apex.exchange/realtime
+[WS] 已恢复订阅: orderbook.BTC-USDC
 [策略] 已启动，交易对=BTC-USDC 价差=1 ticks 单笔=0.001
 [下单] 买单 id=abc123 price=50000.1 size=0.001
 [下单] 卖单 id=def456 price=50000.4 size=0.001
 [策略] 刷新挂单 bid=50000.0 ask=50000.5 buy=50000.1 sell=50000.4 pos=0.0000 spread=0.5000
+[WS] Pong 收到，RTT=12.34ms
+[WS质量] 已连接 RTT=12.34ms 重连次数=0 最近消息=3秒前
+[WS] 读取错误（将触发重连）: websocket: close 1006
+[WS] 检测到断线，第 1 次重连，等待 1s ...
+[策略] WebSocket 未连接（重连中），跳过本轮
+[WS] 连接成功: wss://pro.apex.exchange/realtime
+[WS] 已恢复订阅: orderbook.BTC-USDC
 [盈亏] 成交平仓 size=0.0010 pnl=0.0003 USDC | 累计=0.0003 当日=0.0003 连续亏损=0
 [统计] 持仓=0.0000 均价=0.0000 | 累计盈亏=0.0003 当日盈亏=0.0003 USDC
 [风控] ⚠️  熔断触发！原因: 连续亏损 5 次超过限制 5 次
@@ -386,8 +434,10 @@ kill -SIGTERM <pid>
 
 ### ⚠️ 网络稳定性
 
-- WebSocket 断线后**不会自动重连**，需要重启程序（后续版本可加入断线重连逻辑）
-- 建议在网络稳定的服务器上运行，避免家用网络波动
+- WebSocket 支持**自动断线重连**，采用指数退避策略（1s → 2s → 4s ... 最大 30s）
+- 重连成功后自动恢复所有订阅，策略无需重启
+- 断线期间 `tick()` 会自动跳过，不会产生错误下单
+- 建议在网络稳定的服务器上运行，减少重连频率
 
 ### ⚠️ 盈亏计算精度
 
@@ -418,3 +468,4 @@ api:
 |------|---------|
 | 2026-02-23 | 初始版本：剥皮头策略引擎 + REST/WS 客户端 |
 | 2026-02-23 | 新增独立风控模块（`risk/controller.go`），完善盈亏追踪、熔断、止盈止损逻辑 |
+| 2026-02-23 | WebSocket 重构：新增断线自动重连（指数退避）、订阅自动恢复、连接质量监控（RTT 延迟检测、Pong 超时熔断）、`wsQualityMonitor` goroutine |

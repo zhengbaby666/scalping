@@ -7,6 +7,11 @@ api:
   passphrase: ""     # 填入你的 Passphrase
   l2_key: ""         # 填入你的 StarkEx L2 私钥（如需链上签名）
 
+  # WebSocket 重连参数（一般无需修改）
+  ws_max_reconnect_interval_sec: 30  # 最大退避间隔（秒）
+  ws_ping_interval_sec: 20           # Ping 发送间隔（秒）
+  ws_pong_timeout_sec: 10            # Pong 超时时间（秒），超时则主动断线重连
+
 # 交易对（Apex Pro 格式，例如 BTC-USDC PERP）
 symbol: "BTC-USDC"
 
