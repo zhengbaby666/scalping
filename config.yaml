@@ -1,0 +1,53 @@
+api:
+#  base_url: "https://pro.apex.exchange"   # Apex Pro 主网 REST 地址
+  base_url: "https://testnet.pro.apex.exchange"   # Apex Pro 测试网 REST 地址
+  ws_url: "wss://pro.apex.exchange/realtime"  # WebSocket 地址
+  api_key: ""        # 填入你的 API Key
+  api_secret: ""     # 填入你的 API Secret
+  passphrase: ""     # 填入你的 Passphrase
+  l2_key: ""         # 填入你的 StarkEx L2 私钥（如需链上签名）
+
+# 交易对（Apex Pro 格式，例如 BTC-USDC PERP）
+symbol: "BTC-USDC"
+
+strategy:
+  # 挂单偏移 tick 数（相对于买一/卖一价向内收紧）
+  # 例如 spread_ticks=1，tick_size=0.1 → 买单在 bid+0.1，卖单在 ask-0.1
+  spread_ticks: 1
+
+  # 单笔下单量（合约张数）
+  order_size: 0.001
+
+  # 最大净持仓量（超过后停止同向开仓）
+  max_position: 0.01
+
+  # 挂单刷新间隔（毫秒）
+  refresh_interval_ms: 500
+
+  # 盈利目标（USDC，达到后程序自动退出）
+  take_profit_usdc: 50.0
+
+  # 止损（USDC，超过后程序自动退出）
+  stop_loss_usdc: 20.0
+
+  # 最小价差阈值（USDC，低于此值不挂单）
+  min_spread_usdc: 0.5
+
+  # 价格精度（小数位数）
+  price_precision: 1
+
+  # 数量精度（小数位数）
+  size_precision: 3
+
+risk_control:
+  # 单日最大亏损（USDC）
+  # 当日累计亏损超过此值，触发熔断，停止所有下单
+  max_daily_loss_usdc: 30.0
+
+  # 最大连续亏损次数
+  # 连续亏损超过此次数，触发熔断，需人工重置
+  max_consecutive_loss: 5
+
+  # 账户最低可用余额（USDC）
+  # 可用余额低于此值，触发熔断，停止所有下单
+  min_balance_usdc: 100.0
