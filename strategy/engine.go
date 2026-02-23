@@ -34,6 +34,13 @@ type ScalpingEngine struct {
 	lastPosition   float64
 	lastEntryPrice float64
 
+	// ---- 趋势过滤 + 动态 Spread ----
+	candleAgg    *CandleAggregator // K 线聚合器
+	trendFilter  *TrendFilter      // 双 EMA 趋势过滤器
+	atr          *ATR              // ATR 计算器
+	currentTrend TrendDir          // 当前趋势方向（原子读写用 int32）
+	dynSpreadTks atomic.Value      // 当前动态 spread ticks（int）
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -49,13 +56,45 @@ func NewScalpingEngine(cfg *config.Config) (*ScalpingEngine, error) {
 	ws := apex.NewWsClient(cfg.API.WsURL)
 	rc := risk.NewController(cfg.RiskControl)
 
-	return &ScalpingEngine{
-		cfg:    cfg,
-		client: client,
-		ws:     ws,
-		rc:     rc,
-		stopCh: make(chan struct{}),
-	}, nil
+	// 初始化 K 线聚合器（默认 60s，若配置为 0 则使用默认值）
+	candlePeriod := cfg.Strategy.TrendFilter.CandlePeriodSec
+	if candlePeriod <= 0 {
+		candlePeriod = 60
+	}
+
+	// 初始化趋势过滤器
+	fastPeriod := cfg.Strategy.TrendFilter.FastEMAPeriod
+	slowPeriod := cfg.Strategy.TrendFilter.SlowEMAPeriod
+	threshold := cfg.Strategy.TrendFilter.Threshold
+	if fastPeriod <= 0 {
+		fastPeriod = 9
+	}
+	if slowPeriod <= 0 {
+		slowPeriod = 21
+	}
+	if threshold <= 0 {
+		threshold = 0.0003
+	}
+
+	// 初始化 ATR
+	atrPeriod := cfg.Strategy.DynamicSpread.ATRPeriod
+	if atrPeriod <= 0 {
+		atrPeriod = 14
+	}
+
+	e := &ScalpingEngine{
+		cfg:         cfg,
+		client:      client,
+		ws:          ws,
+		rc:          rc,
+		candleAgg:   NewCandleAggregator(candlePeriod),
+		trendFilter: NewTrendFilter(fastPeriod, slowPeriod, threshold),
+		atr:         NewATR(atrPeriod),
+		stopCh:      make(chan struct{}),
+	}
+	// 初始化动态 spread 为配置的静态值
+	e.dynSpreadTks.Store(cfg.Strategy.SpreadTicks)
+	return e, nil
 }
 
 // Start 启动策略
@@ -81,13 +120,15 @@ func (e *ScalpingEngine) Start() error {
 	}
 
 	// 4. 启动后台 goroutine
-	e.wg.Add(3)
-	go e.mainLoop()        // 主循环：500ms 刷新挂单
-	go e.pnlMonitorLoop()  // 盈亏监控：2s 检查持仓变化
+	e.wg.Add(4)
+	go e.mainLoop()         // 主循环：500ms 刷新挂单
+	go e.pnlMonitorLoop()   // 盈亏监控：2s 检查持仓变化
 	go e.wsQualityMonitor() // 连接质量：30s 打印报告
+	go e.indicatorLoop()    // 指标更新：K 线聚合 → ATR/EMA 更新
 
-	log.Printf("[策略] 已启动，交易对=%s 价差=%d ticks 单笔=%v",
-		e.cfg.Symbol, e.cfg.Strategy.SpreadTicks, e.cfg.Strategy.OrderSize)
+	log.Printf("[策略] 已启动，交易对=%s 价差=%d ticks 单笔=%v 趋势过滤=%v 动态Spread=%v",
+		e.cfg.Symbol, e.cfg.Strategy.SpreadTicks, e.cfg.Strategy.OrderSize,
+		e.cfg.Strategy.TrendFilter.Enabled, e.cfg.Strategy.DynamicSpread.Enabled)
 	return nil
 }
 
@@ -146,7 +187,7 @@ func (e *ScalpingEngine) mainLoop() {
 	}
 }
 
-// tick 单次执行：风控检查 → WS 状态检查 → 计算报价 → 刷新挂单
+// tick 单次执行：风控检查 → WS 状态检查 → 趋势过滤 → 动态 Spread → 计算报价 → 刷新挂单
 func (e *ScalpingEngine) tick() error {
 	// ---- Step 1: 风控检查 ----
 	account, err := e.client.GetAccount()
@@ -178,8 +219,11 @@ func (e *ScalpingEngine) tick() error {
 		return nil
 	}
 
-	// ---- Step 4: 计算挂单价格 ----
-	offset := float64(e.cfg.Strategy.SpreadTicks) * e.tickSize()
+	// ---- Step 4: 动态 Spread 计算 ----
+	spreadTicks := e.getSpreadTicks()
+
+	// ---- Step 5: 计算挂单价格 ----
+	offset := float64(spreadTicks) * e.tickSize()
 	buyPrice := e.roundPrice(bid + offset)
 	sellPrice := e.roundPrice(ask - offset)
 
@@ -188,7 +232,7 @@ func (e *ScalpingEngine) tick() error {
 		return nil
 	}
 
-	// ---- Step 5: 查询持仓 ----
+	// ---- Step 6: 查询持仓 ----
 	pos, err := e.getPosition()
 	if err != nil {
 		return fmt.Errorf("获取持仓失败: %w", err)
@@ -196,24 +240,132 @@ func (e *ScalpingEngine) tick() error {
 
 	sizeStr := fmt.Sprintf("%.*f", e.cfg.Strategy.SizePrecision, e.cfg.Strategy.OrderSize)
 
-	// ---- Step 6: 撤旧单 → 挂新单 ----
+	// ---- Step 7: 趋势过滤 → 决定挂单方向 ----
+	allowBuy, allowSell := e.getAllowedSides(pos)
+
+	// ---- Step 8: 撤旧单 → 挂新单 ----
 	e.cancelBothOrders()
 
 	maxPos := e.cfg.Strategy.MaxPosition
-	if math.Abs(pos) < maxPos {
+	if allowBuy && math.Abs(pos) < maxPos {
 		if err := e.placeBuyOrder(buyPrice, sizeStr); err != nil {
 			log.Printf("[策略] 挂买单失败: %v", err)
 		}
 	}
-	if math.Abs(pos) < maxPos {
+	if allowSell && math.Abs(pos) < maxPos {
 		if err := e.placeSellOrder(sellPrice, sizeStr); err != nil {
 			log.Printf("[策略] 挂卖单失败: %v", err)
 		}
 	}
 
-	log.Printf("[策略] 刷新挂单 bid=%.4f ask=%.4f buy=%.4f sell=%.4f pos=%.4f spread=%.4f",
-		bid, ask, buyPrice, sellPrice, pos, spread)
+	log.Printf("[策略] 刷新挂单 bid=%.4f ask=%.4f buy=%.4f sell=%.4f pos=%.4f spread=%.4f spreadTicks=%d 趋势=%s",
+		bid, ask, buyPrice, sellPrice, pos, spread, spreadTicks, e.currentTrend)
 	return nil
+}
+
+// getSpreadTicks 获取当前有效的 spread ticks（动态或静态）
+func (e *ScalpingEngine) getSpreadTicks() int {
+	if !e.cfg.Strategy.DynamicSpread.Enabled {
+		return e.cfg.Strategy.SpreadTicks
+	}
+	if v := e.dynSpreadTks.Load(); v != nil {
+		return v.(int)
+	}
+	return e.cfg.Strategy.SpreadTicks
+}
+
+// getAllowedSides 根据趋势方向决定允许挂单的方向
+// 返回 (allowBuy, allowSell)
+func (e *ScalpingEngine) getAllowedSides(pos float64) (bool, bool) {
+	if !e.cfg.Strategy.TrendFilter.Enabled {
+		return true, true
+	}
+
+	// 指标尚未就绪，双边挂单（预热阶段）
+	if !e.trendFilter.Ready() {
+		return true, true
+	}
+
+	switch e.currentTrend {
+	case TrendUp:
+		// 上升趋势：只允许买单（做多方向）
+		// 若已有多头持仓超过阈值，也允许挂卖单平仓
+		allowSell := pos > 0 // 有多头持仓时允许挂卖单平仓
+		return true, allowSell
+	case TrendDown:
+		// 下降趋势：只允许卖单（做空方向）
+		// 若已有空头持仓超过阈值，也允许挂买单平仓
+		allowBuy := pos < 0 // 有空头持仓时允许挂买单平仓
+		return allowBuy, true
+	default:
+		// 横盘：双边挂单
+		return true, true
+	}
+}
+
+// ---------- 指标更新循环 ----------
+
+// indicatorLoop 每 100ms 检查一次是否有新 K 线完成，更新 ATR/EMA/趋势
+func (e *ScalpingEngine) indicatorLoop() {
+	defer e.wg.Done()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-ticker.C:
+			e.updateIndicators()
+		}
+	}
+}
+
+// updateIndicators 用当前中间价 feed K 线聚合器，若有新 K 线则更新 ATR/EMA
+func (e *ScalpingEngine) updateIndicators() {
+	bid, ask, ok := e.getBestPrices()
+	if !ok {
+		return
+	}
+	mid := (bid + ask) / 2
+	nowSec := time.Now().Unix()
+
+	closed := e.candleAgg.Feed(mid, nowSec)
+	if closed == nil {
+		return // 当前 K 线尚未完成
+	}
+
+	// 更新 ATR
+	atrVal := e.atr.Update(closed.High, closed.Low, closed.Close)
+
+	// 更新趋势过滤器
+	trend := e.trendFilter.Update(closed.Close)
+	e.currentTrend = trend
+
+	// 更新动态 spread ticks
+	if e.cfg.Strategy.DynamicSpread.Enabled && e.atr.Ready() {
+		ds := e.cfg.Strategy.DynamicSpread
+		tickSz := e.tickSize()
+		if tickSz > 0 {
+			rawTicks := int(math.Round(atrVal * ds.Multiplier / tickSz))
+			// clamp 到 [min_ticks, max_ticks]
+			if rawTicks < ds.MinTicks {
+				rawTicks = ds.MinTicks
+			}
+			if ds.MaxTicks > 0 && rawTicks > ds.MaxTicks {
+				rawTicks = ds.MaxTicks
+			}
+			e.dynSpreadTks.Store(rawTicks)
+			log.Printf("[指标] K线完成 close=%.4f ATR=%.4f spreadTicks=%d 趋势=%s EMA快=%.4f EMA慢=%.4f",
+				closed.Close, atrVal, rawTicks, trend,
+				e.trendFilter.FastValue(), e.trendFilter.SlowValue())
+		}
+	} else {
+		log.Printf("[指标] K线完成 close=%.4f ATR=%.4f(预热中) 趋势=%s EMA快=%.4f EMA慢=%.4f",
+			closed.Close, atrVal, trend,
+			e.trendFilter.FastValue(), e.trendFilter.SlowValue())
+	}
 }
 
 // ---------- 盈亏监控 ----------

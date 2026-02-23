@@ -56,3 +56,46 @@ risk_control:
   # 账户最低可用余额（USDC）
   # 可用余额低于此值，触发熔断，停止所有下单
   min_balance_usdc: 100.0
+
+# ---- 趋势过滤（防止单边行情被碾压）----
+# 原理：双 EMA 交叉判断趋势方向
+#   上升趋势 → 只挂买单（不挂卖单，避免逆势做空）
+#   下降趋势 → 只挂卖单（不挂买单，避免逆势做多）
+#   横盘     → 双边挂单（正常做市）
+trend_filter:
+  enabled: true
+
+  # K 线聚合周期（秒）
+  # 60 = 1 分钟 K 线，推荐 60~300
+  candle_period_sec: 60
+
+  # 快线 EMA 周期（K 线数）
+  fast_ema_period: 9
+
+  # 慢线 EMA 周期（K 线数）
+  slow_ema_period: 21
+
+  # 趋势判断阈值（EMA 偏离比例）
+  # 0.0003 = 快线偏离慢线 0.03% 才认定为趋势，防止频繁切换
+  threshold: 0.0003
+
+# ---- 动态 Spread（ATR 自适应）----
+# 原理：根据市场波动率（ATR）动态调整挂单偏移量
+#   波动大 → spread 变宽（保守，避免被扫单）
+#   波动小 → spread 变窄（激进，提高成交率）
+dynamic_spread:
+  enabled: true
+
+  # ATR 周期（K 线数）
+  atr_period: 14
+
+  # ATR 乘数：动态 spread_ticks = round(ATR × multiplier / tick_size)
+  # 例如 ATR=50 USDC，multiplier=0.1，tick_size=0.1 → spread_ticks = 50
+  # 建议从 0.05~0.2 开始调试
+  multiplier: 0.1
+
+  # 最小 spread（tick 数），防止 ATR 过小时挂单太激进
+  min_ticks: 1
+
+  # 最大 spread（tick 数），防止 ATR 过大时挂单太保守
+  max_ticks: 20

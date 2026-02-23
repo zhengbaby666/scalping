@@ -17,6 +17,7 @@
 7. [快速开始](#7-快速开始)
 8. [日志说明](#8-日志说明)
 9. [注意事项](#9-注意事项)
+10. [参数调整建议](#10-参数调整建议)
 
 ---
 
@@ -91,12 +92,52 @@ scalping/
 - 确保始终以 **Maker** 身份成交，享受更低（甚至负）手续费
 - 避免因价格滑动导致意外吃单亏损
 
-### 3.3 持仓控制
+### 3.3 趋势过滤（防止单边碾压）
+
+趋势过滤通过**双 EMA 交叉**判断当前市场方向，动态调整挂单方向，避免在单边行情中被反复扫单：
+
+```
+趋势判断逻辑（每根 K 线更新一次）：
+  fastEMA(9) > slowEMA(21) × (1 + threshold) → 上升趋势 ↑
+  fastEMA(9) < slowEMA(21) × (1 - threshold) → 下降趋势 ↓
+  否则                                         → 横盘 →
+
+挂单方向控制：
+  上升趋势 ↑ → 只挂买单（顺势做多）
+               若已有多头持仓，允许挂卖单平仓
+  下降趋势 ↓ → 只挂卖单（顺势做空）
+               若已有空头持仓，允许挂买单平仓
+  横盘    → → 双边挂单（正常做市，赚价差）
+```
+
+**预热阶段**：慢线 EMA 积累足够 K 线数量（`slow_ema_period` 根）之前，默认双边挂单。
+
+### 3.4 动态 Spread（ATR 自适应）
+
+使用 **ATR（真实波幅均值）** 衡量市场波动率，动态调整挂单偏移量：
+
+```
+动态 spread_ticks = round(ATR × multiplier / tick_size)
+最终值 clamp 到 [min_ticks, max_ticks]
+
+示例（BTC，tick_size=0.1，multiplier=0.1）：
+  ATR = 50 USDC（低波动）→ spread_ticks = round(50×0.1/0.1) = 50
+  ATR = 200 USDC（高波动）→ spread_ticks = min(200, max_ticks=20) = 20
+```
+
+> **注意**：ATR 乘数需根据实际行情调试。BTC 日内 ATR 通常在 100~500 USDC，
+> 建议 `multiplier=0.05~0.1`，`min_ticks=1`，`max_ticks=10~20`。
+
+**效果：**
+- 波动大时 → spread 变宽 → 挂单离市价更远 → 减少被扫单概率
+- 波动小时 → spread 变窄 → 挂单贴近市价 → 提高成交率
+
+### 3.5 持仓控制
 
 - 当净持仓绝对值 ≥ `max_position` 时，停止同向开仓
 - 买单和卖单独立判断，不会因为一侧满仓而影响另一侧平仓
 
-### 3.4 最小价差过滤
+### 3.6 最小价差过滤
 
 - 当市场买卖价差 < `min_spread_usdc` 时，跳过本轮挂单
 - 防止在价差过小时挂单，避免手续费侵蚀利润
@@ -112,18 +153,21 @@ scalping/
   │
   ├─ 加载 config.yaml（支持环境变量覆盖）
   ├─ 初始化 REST 客户端、WebSocket 客户端、风控控制器
+  ├─ 初始化指标：K 线聚合器 / 趋势过滤器（双 EMA）/ ATR 计算器
   ├─ 建立 WebSocket 连接，订阅订单簿
   │    └─ WsClient 内部启动：reconnectLoop / readLoop / pingLoop
   │
   ├─ 启动 goroutine 1：主循环（mainLoop）
   │    └─ 每 500ms 执行一次 tick()
-  │         └─ Step 0：检查 WS 是否已连接，断线中则跳过本轮
   │
   ├─ 启动 goroutine 2：盈亏监控循环（pnlMonitorLoop）
   │    └─ 每 2s 检查持仓变化，更新盈亏，检查止盈止损
   │
   ├─ 启动 goroutine 3：连接质量监控（wsQualityMonitor）
   │    └─ 每 30s 打印 WS 连接状态、RTT、重连次数、最近消息时间
+  │
+  ├─ 启动 goroutine 4：指标更新循环（indicatorLoop）
+  │    └─ 每 100ms 推入中间价 → K 线聚合 → 有新 K 线时更新 ATR/EMA/趋势
   │
   └─ 等待 SIGINT / SIGTERM 信号
        └─ 收到信号 → Stop() → 撤销所有挂单 → 打印最终统计 → 退出
@@ -134,9 +178,6 @@ scalping/
 ```
 tick()
   │
-  ├─ Step 0：WebSocket 连接检查
-  │    └─ ws.Quality().Connected == false？→ 跳过本轮（等待重连）
-  │
   ├─ Step 1：风控检查
   │    ├─ 查询账户可用余额
   │    └─ rc.Check(balance)
@@ -145,22 +186,49 @@ tick()
   │         ├─ 当日亏损 ≥ max_daily_loss_usdc？→ 熔断
   │         └─ 连续亏损 ≥ max_consecutive_loss？→ 熔断
   │
-  ├─ Step 2：获取最优价（来自 WebSocket 缓存）
+  ├─ Step 2：WebSocket 连接检查
+  │    └─ ws.IsReady() == false？→ 跳过本轮（等待重连）
+  │
+  ├─ Step 3：获取最优价（来自 WebSocket 缓存）
   │    └─ 价差 < min_spread_usdc？→ 跳过本轮
   │
-  ├─ Step 3：计算挂单价格
-  │    ├─ buyPrice  = round(Bid + spread_ticks × tick_size)
-  │    └─ sellPrice = round(Ask - spread_ticks × tick_size)
+  ├─ Step 4：动态 Spread 计算
+  │    └─ 读取 indicatorLoop 最新计算的 dynSpreadTks
+  │         └─ 未启用动态 spread → 使用配置的静态 spread_ticks
+  │
+  ├─ Step 5：计算挂单价格
+  │    ├─ buyPrice  = round(Bid + spreadTicks × tick_size)
+  │    └─ sellPrice = round(Ask - spreadTicks × tick_size)
   │         └─ buyPrice ≥ sellPrice？→ 价格异常，跳过
   │
-  ├─ Step 4：查询当前净持仓
+  ├─ Step 6：查询当前净持仓
   │
-  └─ Step 5：撤旧单 → 挂新单
-       ├─ |pos| < max_position → 挂买单（POST_ONLY）
-       └─ |pos| < max_position → 挂卖单（POST_ONLY）
+  ├─ Step 7：趋势过滤 → 决定挂单方向
+  │    ├─ 趋势未就绪（预热中）→ 双边挂单
+  │    ├─ 上升趋势 ↑ → 只挂买单（有多头持仓时允许挂卖单平仓）
+  │    ├─ 下降趋势 ↓ → 只挂卖单（有空头持仓时允许挂买单平仓）
+  │    └─ 横盘    → → 双边挂单
+  │
+  └─ Step 8：撤旧单 → 挂新单
+       ├─ allowBuy  && |pos| < max_position → 挂买单（POST_ONLY）
+       └─ allowSell && |pos| < max_position → 挂卖单（POST_ONLY）
 ```
 
-### 4.3 盈亏监控循环（每 2 秒）
+### 4.3 指标更新循环（每 100ms）
+
+```
+indicatorLoop()
+  │
+  └─ 每 100ms 推入当前中间价 → CandleAggregator.Feed()
+       └─ 有新 K 线完成？
+            ├─ ATR.Update(high, low, close)  → 更新波动率
+            ├─ TrendFilter.Update(close)     → 更新 EMA，判断趋势方向
+            │    └─ 更新 currentTrend（TrendUp / TrendDown / TrendNeutral）
+            └─ 计算 dynSpreadTks = clamp(round(ATR × multiplier / tick_size), min, max)
+                 └─ 原子写入 dynSpreadTks（供 tick() 读取）
+```
+
+### 4.4 盈亏监控循环（每 2 秒）
 
 ```
 pnlMonitorLoop()
@@ -178,7 +246,7 @@ pnlMonitorLoop()
        └─ 累计亏损 ≥ stop_loss_usdc  → 撤单 + 停止策略
 ```
 
-### 4.4 WebSocket 心跳与重连机制
+### 4.5 WebSocket 心跳与重连机制
 
 ```
 WsClient 后台 goroutine 架构：
@@ -246,7 +314,7 @@ api:
 symbol: "BTC-USDC"   # 交易对（Apex Pro 格式）
 
 strategy:
-  spread_ticks: 1          # 挂单偏移 tick 数（相对买一/卖一向内收紧）
+  spread_ticks: 1          # 静态挂单偏移 tick 数（动态 spread 启用时作为初始值）
   order_size: 0.001        # 单笔下单量（合约张数）
   max_position: 0.01       # 最大净持仓量（超过后停止同向开仓）
   refresh_interval_ms: 500 # 挂单刷新间隔（毫秒）
@@ -255,15 +323,31 @@ strategy:
   min_spread_usdc: 0.5     # 最小价差阈值（低于此值不挂单）
   price_precision: 1       # 价格精度（小数位数，BTC 通常为 1）
   size_precision: 3        # 数量精度（小数位数）
+
+  trend_filter:
+    enabled: true
+    candle_period_sec: 60  # K 线周期（秒）
+    fast_ema_period: 9     # 快线 EMA 周期
+    slow_ema_period: 21    # 慢线 EMA 周期
+    threshold: 0.0003      # 趋势判断阈值（EMA 偏离比例）
+
+  dynamic_spread:
+    enabled: true
+    atr_period: 14         # ATR 周期
+    multiplier: 0.1        # ATR 乘数
+    min_ticks: 1           # 最小 spread（tick 数）
+    max_ticks: 20          # 最大 spread（tick 数）
 ```
 
 | 参数 | 说明 | 建议值（BTC） |
 |------|------|-------------|
-| `spread_ticks` | 越小越激进，越大越保守 | 1~3 |
+| `spread_ticks` | 动态 spread 未就绪时的静态值 | 1~3 |
 | `order_size` | 单笔量，影响每次盈亏绝对值 | 0.001 |
 | `max_position` | 最大持仓敞口控制 | 0.01~0.05 |
 | `refresh_interval_ms` | 刷新越快越贴近市场，但 API 调用越频繁 | 500~1000 |
 | `min_spread_usdc` | 低于此值市场流动性差，不适合挂单 | 0.3~1.0 |
+| `trend_filter.threshold` | 越小越灵敏（频繁切换），越大越稳定 | 0.0002~0.0005 |
+| `dynamic_spread.multiplier` | 越大 spread 越宽（保守），越小越激进 | 0.05~0.2 |
 
 ### 5.3 风控参数
 
@@ -462,6 +546,137 @@ api:
 
 ---
 
+## 10. 参数调整建议
+
+本章节提供各核心参数的调整思路，帮助在不同行情环境下快速找到合适的配置。
+
+### 10.1 spread_ticks / dynamic_spread
+
+`spread_ticks` 是动态 spread 未就绪时的静态兜底值，也是调试的起点。
+
+| 现象 | 调整方向 |
+|------|----------|
+| 成交率极低，挂单长时间未成交 | 减小 `spread_ticks` 或 `multiplier`，让报价更贴近市场 |
+| 频繁被扫单（买单成交后价格继续下跌） | 增大 `spread_ticks` 或 `multiplier`，拉开与市价的距离 |
+| 波动大时亏损加剧 | 增大 `dynamic_spread.multiplier`（如 0.15~0.2），让 spread 随波动自动扩宽 |
+| 波动小时成交率仍然低 | 减小 `dynamic_spread.min_ticks`（如设为 1），允许 spread 收得更窄 |
+| spread 变化幅度过大，不稳定 | 缩小 `[min_ticks, max_ticks]` 区间，限制 spread 的变化范围 |
+
+**BTC 参考起点：**
+```
+multiplier = 0.1，min_ticks = 1，max_ticks = 15
+```
+
+---
+
+### 10.2 trend_filter（趋势过滤）
+
+趋势过滤的核心是 **EMA 周期** 和 **threshold 阈值** 的配合。
+
+| 现象 | 调整方向 |
+|------|----------|
+| 趋势切换太频繁，方向反复横跳 | 增大 `threshold`（如 0.0005~0.001），需要更大偏离才认定为趋势 |
+| 趋势反应太慢，单边行情已走了很久才切换 | 减小 `candle_period_sec`（如 30s）或减小 `slow_ema_period`（如 15） |
+| 横盘时被误判为趋势，单边挂单导致持仓堆积 | 增大 `threshold`，或增大 `slow_ema_period`（如 30） |
+| 趋势判断准确但预热时间太长 | 减小 `slow_ema_period`，或减小 `candle_period_sec` |
+
+**EMA 周期组合参考：**
+
+| 风格 | fast | slow | candle_period_sec | threshold |
+|------|------|------|-------------------|-----------|
+| 激进（短线） | 5 | 13 | 30 | 0.0002 |
+| 均衡（默认） | 9 | 21 | 60 | 0.0003 |
+| 保守（稳健） | 12 | 26 | 120 | 0.0005 |
+
+> **注意**：`candle_period_sec` 越小，K 线越密集，EMA 对短期波动越敏感；越大则越平滑，适合趋势明显的行情。
+
+---
+
+### 10.3 ATR 周期（atr_period）
+
+ATR 周期决定波动率计算的平滑程度：
+
+| 场景 | 建议 |
+|------|------|
+| 希望 spread 快速响应短期波动 | 减小 `atr_period`（如 7~10） |
+| 希望 spread 更平稳，避免频繁变化 | 增大 `atr_period`（如 20~28） |
+| 默认均衡 | `atr_period = 14`（Wilder 经典参数） |
+
+---
+
+### 10.4 风控参数
+
+风控参数直接影响账户安全，建议**先保守后放开**：
+
+| 参数 | 保守值 | 均衡值 | 激进值 | 说明 |
+|------|--------|--------|--------|------|
+| `max_daily_loss_usdc` | 10 | 30 | 100 | 单日最大亏损，建议不超过账户余额的 5% |
+| `max_consecutive_loss` | 3 | 5 | 10 | 连续亏损次数，越小越敏感 |
+| `min_balance_usdc` | 200 | 100 | 50 | 余额保护线，低于此值停止下单 |
+| `stop_loss_usdc` | 10 | 20 | 50 | 累计止损，触发后程序退出 |
+| `take_profit_usdc` | 20 | 50 | 200 | 累计止盈，触发后程序退出 |
+
+> **建议**：`stop_loss_usdc` 设置为 `max_daily_loss_usdc` 的 50%~70%，两者形成双重保护。
+
+---
+
+### 10.5 order_size 与 max_position
+
+```
+建议关系：max_position = order_size × 5~10
+
+示例（BTC）：
+  order_size = 0.001 BTC
+  max_position = 0.005~0.01 BTC
+  单次最大风险 ≈ order_size × ATR ≈ 0.001 × 200 = 0.2 USDC
+```
+
+- `order_size` 越大，每次成交盈亏绝对值越大，风险也越高
+- `max_position` 控制最大敞口，超过后停止同向开仓，防止持仓无限堆积
+- 两者比例建议保持在 **1:5 ~ 1:10**，给策略足够的加仓空间
+
+---
+
+### 10.6 refresh_interval_ms
+
+```
+刷新间隔 = API 调用频率的主要决定因素
+每次 tick 约消耗 6 次 REST API 调用
+
+建议：
+  测试阶段：1000ms（保守，避免触发限频）
+  正式运行：500ms（均衡）
+  极限模式：200ms（需确认 Apex Pro 账户的 API 限频额度）
+```
+
+> 若日志中出现 HTTP 429 错误，立即增大此值。
+
+---
+
+### 10.7 调参流程建议
+
+```
+第一步：测试网验证基础功能
+  └─ 使用默认配置，确认挂单/撤单/持仓查询正常
+
+第二步：调整 spread 参数
+  └─ 观察成交率 vs 被扫单频率，找到平衡点
+
+第三步：启用趋势过滤
+  └─ 观察趋势切换是否合理，调整 threshold 和 EMA 周期
+
+第四步：启用动态 spread
+  └─ 观察 ATR 计算值，调整 multiplier 使 spread 在合理范围内波动
+
+第五步：收紧风控参数
+  └─ 从保守值开始，逐步放开，直到找到适合自己风险偏好的配置
+
+第六步：切换主网小仓位验证
+  └─ 使用最小 order_size，验证主网行为与测试网一致
+```
+
+---
+
 ## 代码变更记录
 
 | 日期 | 变更内容 |
@@ -469,3 +684,4 @@ api:
 | 2026-02-23 | 初始版本：剥皮头策略引擎 + REST/WS 客户端 |
 | 2026-02-23 | 新增独立风控模块（`risk/controller.go`），完善盈亏追踪、熔断、止盈止损逻辑 |
 | 2026-02-23 | WebSocket 重构：新增断线自动重连（指数退避）、订阅自动恢复、连接质量监控（RTT 延迟检测、Pong 超时熔断）、`wsQualityMonitor` goroutine |
+| 2026-02-23 | 新增趋势过滤模块（双 EMA 交叉，防止单边行情被碾压）+ 动态 Spread（ATR 自适应，波动大时自动扩宽挂单间距）；新增 `strategy/indicator.go` 指标模块（EMA/ATR/K 线聚合器）；新增 `indicatorLoop` goroutine |

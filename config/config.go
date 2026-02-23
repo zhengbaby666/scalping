@@ -64,6 +64,51 @@ type StrategyConfig struct {
 
 	// 数量精度（小数位数）
 	SizePrecision int `yaml:"size_precision"`
+
+	// 趋势过滤配置
+	TrendFilter TrendFilterConfig `yaml:"trend_filter"`
+
+	// 动态 Spread（ATR）配置
+	DynamicSpread DynamicSpreadConfig `yaml:"dynamic_spread"`
+}
+
+// TrendFilterConfig 趋势过滤参数
+type TrendFilterConfig struct {
+	// 是否启用趋势过滤（默认 true）
+	Enabled bool `yaml:"enabled"`
+
+	// K 线聚合周期（秒），用于计算 EMA/ATR
+	// 例如 60 = 1 分钟 K 线
+	CandlePeriodSec int64 `yaml:"candle_period_sec"`
+
+	// 快线 EMA 周期（K 线数）
+	FastEMAPeriod int `yaml:"fast_ema_period"`
+
+	// 慢线 EMA 周期（K 线数）
+	SlowEMAPeriod int `yaml:"slow_ema_period"`
+
+	// 趋势判断阈值（EMA 偏离比例，如 0.0003 = 0.03%）
+	// 快线偏离慢线超过此比例才认定为趋势
+	Threshold float64 `yaml:"threshold"`
+}
+
+// DynamicSpreadConfig 动态 Spread（ATR）参数
+type DynamicSpreadConfig struct {
+	// 是否启用动态 Spread（默认 true）
+	Enabled bool `yaml:"enabled"`
+
+	// ATR 周期（K 线数）
+	ATRPeriod int `yaml:"atr_period"`
+
+	// ATR 乘数：动态 spread = ATR × multiplier
+	// 最终 spread 会被 clamp 在 [min_ticks, max_ticks] 之间
+	Multiplier float64 `yaml:"multiplier"`
+
+	// 最小 spread（tick 数），防止 ATR 过小时挂单太激进
+	MinTicks int `yaml:"min_ticks"`
+
+	// 最大 spread（tick 数），防止 ATR 过大时挂单太保守
+	MaxTicks int `yaml:"max_ticks"`
 }
 
 // RiskConfig 风控配置
